@@ -1,5 +1,28 @@
 # WhatsApp Coach Bot — Setup Guide
 
+---
+
+## Streamlit UI
+
+A visual dashboard to chat with the agent and see its pipeline in real-time.
+
+### Setup
+```bash
+pip install -r requirements.txt
+```
+
+### Run
+Start the Node.js backend first, then:
+```bash
+npm run streamlit
+```
+
+This opens a browser with:
+- **Left panel**: Chat interface
+- **Right panel**: Agent thoughts + pipeline visualization (extracted → stored → notified)
+
+---
+
 ## What this bot does
 - Greets visitors on WhatsApp
 - Qualifies them (understands their challenge)

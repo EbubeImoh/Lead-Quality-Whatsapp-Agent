@@ -172,5 +172,91 @@ app.post("/webhook", async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("Coach bot is running ✓"));
 
+// ─── Streamlit UI API Endpoints ───────────────────────────────────────────────
+app.post("/api/chat", async (req, res) => {
+  const { message, phone } = req.body;
+  const userPhone = phone || "streamlit-user";
+
+  if (!message) {
+    return res.status(400).json({ error: "Message required" });
+  }
+
+  try {
+    const session = getSession(userPhone);
+    const pipelineSteps = [];
+    
+    pipelineSteps.push({ step: "received", label: "Message Received", timestamp: new Date().toISOString() });
+    
+    // Extract lead info
+    extractLeadInfo(session, message);
+    if (session.lead.email || session.lead.name) {
+      pipelineSteps.push({ step: "extracted", label: "Data Extracted", details: session.lead, timestamp: new Date().toISOString() });
+    }
+
+    // Get AI response
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...session.history,
+      ],
+      temperature: 0.7,
+      max_tokens: 200,
+    });
+
+    let reply = response.choices[0].message.content;
+    pipelineSteps.push({ step: "reasoning", label: "Agent Reasoning", details: "Generated response", timestamp: new Date().toISOString() });
+
+    // Check for lead capture or call booking
+    let status = "ongoing";
+    if (reply.includes("LEAD_CAPTURED")) {
+      reply = reply.replace("LEAD_CAPTURED", "").trim();
+      await saveLead(session.lead, userPhone);
+      await notifyCoach(session.lead);
+      pipelineSteps.push({ step: "stored", label: "Lead Stored", details: session.lead, timestamp: new Date().toISOString() });
+      pipelineSteps.push({ step: "notified", label: "Coach Notified", details: { name: session.lead.name, email: session.lead.email }, timestamp: new Date().toISOString() });
+      status = "lead_captured";
+    }
+
+    if (reply.includes("CALL_BOOKED")) {
+      reply = reply.replace("CALL_BOOKED", "").trim();
+      session.lead.status = "call_booked";
+      await saveLead(session.lead, userPhone);
+      pipelineSteps.push({ step: "stored", label: "Call Booked", details: session.lead, timestamp: new Date().toISOString() });
+      pipelineSteps.push({ step: "notified", label: "Coach Notified", details: { name: session.lead.name }, timestamp: new Date().toISOString() });
+      status = "call_booked";
+    }
+
+    // Add to history
+    session.history.push({ role: "user", content: message });
+    session.history.push({ role: "assistant", content: reply });
+
+    res.json({
+      reply,
+      lead: session.lead,
+      pipeline: pipelineSteps,
+      status,
+      history: session.history
+    });
+  } catch (err) {
+    console.error("Bot error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/session/:phone", (req, res) => {
+  const { phone } = req.params;
+  const session = getSession(phone);
+  res.json(session);
+});
+
+app.get("/api/sessions", (req, res) => {
+  res.json(Object.keys(sessions).map(phone => ({
+    phone,
+    lead: sessions[phone].lead,
+    step: sessions[phone].step
+  })));
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bot live on port ${PORT}`));
