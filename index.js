@@ -1,242 +1,325 @@
-// WhatsApp Coach Bot — Lead Capture + FAQ
-// Stack: Node.js + Express + OpenAI + Twilio (WhatsApp Sandbox)
-// Deploy on: Railway / Render / Fly.io (free tier works)
-
 import express from "express";
+import dotenv from "dotenv";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
+import path from "path";
+import { fileURLToPath } from 'url';
+import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config();
+
 const app = express();
+
+// ─── Rate Limiting Security Layer ─────────────────────────────────────────────
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, 
+  max: 100, 
+  standardHeaders: true, 
+  legacyHeaders: false, 
+  message: { error: "Too many requests, please try again later." }
+});
+
+const aiLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false }, // Suppress trust proxy warnings if not needed
+  keyGenerator: (req) => {
+    // Use the phone/session_id from body or query. 
+    // This ensures credits are tracked per browser session.
+    return req.body.phone || req.query.phone || req.ip;
+  },
+  handler: (req, res) => {
+    res.status(429).json({ 
+      reply: "Whoa there, speed racer! 🏎️ You've used up your 5 daily credits. Coach Clara needs a coffee break, and so does my API quota. \n\n**Love this system?** I can build one for your business too! Reach out to my creator at **ebubeimoh@gmail.com** and let's automate your hustle. 😉",
+      error: "Rate limit exceeded",
+      reasoning: "Rate limit reached. Creator contact recommended.",
+      confidence: "1.00",
+      stage: "Limit Reached"
+    });
+  }
+});
+
+app.use(generalLimiter);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const openai = new OpenAI({
+    apiKey: DEEPSEEK_API_KEY,
+    baseURL: "https://api.deepseek.com/v1"
+});
 
-// ─── In-memory session store (swap for Redis in production) ───────────────────
+// ─── Database Setup (SQLite) ──────────────────────────────────────────────────
+let db;
+(async () => {
+  const dbPath = path.resolve(__dirname, "database.sqlite");
+  console.log("Initializing database at:", dbPath);
+  db = await open({
+    filename: dbPath,
+    driver: sqlite3.Database
+  });
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS leads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT,
+      name TEXT,
+      email TEXT,
+      challenge TEXT,
+      status TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT,
+      role TEXT,
+      content TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  console.log("Database initialized successfully.");
+})();
+
+// ─── In-memory session store (backed by SQLite) ──────────────────────────────
 const sessions = {};
 
-function getSession(phone) {
+async function getSession(phone) {
   if (!sessions[phone]) {
-    sessions[phone] = { step: "start", lead: {}, history: [] };
+    const lead = await db.get("SELECT * FROM leads WHERE phone = ?", [phone]) || {};
+    const dbHistory = await db.all("SELECT role, content FROM history WHERE phone = ? ORDER BY timestamp ASC", [phone]);
+    
+    let stage = "Asking Challenge";
+    if (lead.email) stage = "Lead Captured";
+    else if (lead.name) stage = "Collecting Email";
+    else if (lead.challenge) stage = "Collecting Name";
+
+    sessions[phone] = { 
+        stage: stage, 
+        lead: {
+            name: lead.name || "",
+            email: lead.email || "",
+            challenge: lead.challenge || "",
+            status: lead.status || "ongoing"
+        }, 
+        history: dbHistory.length > 0 ? dbHistory : []
+    };
   }
   return sessions[phone];
 }
 
-// ─── Coach persona + FAQ context ─────────────────────────────────────────────
-const SYSTEM_PROMPT = `
-You are the AI assistant for Coach Clara, a business and mindset coach.
-Your job is to:
-1. Warmly greet and qualify leads
-2. Understand their main challenge
-3. Collect their name and email
-4. Book them for a free 20-min discovery call OR send them Clara's free guide
-5. Answer FAQs about Clara's coaching programs
-
-Clara's programs:
-- 1:1 Business Coaching ($500/month) — strategy, accountability, scaling
-- Mindset Reset ($200/month) — confidence, clarity, work-life balance
-- Group Mastermind ($150/month) — community + weekly calls
-
-Keep responses SHORT (max 2 sentences). Be warm, not salesy.
-When you have collected name + email + challenge, end with: "LEAD_CAPTURED"
-When user books a call, end with: "CALL_BOOKED"
-`;
-
-// ─── Conversation flow handler ────────────────────────────────────────────────
-async function handleMessage(phone, userMsg) {
-  const session = getSession(phone);
-
-  // Add user message to history
-  session.history.push({ role: "user", content: userMsg });
-
-  // Extract lead info if present in conversation
-  extractLeadInfo(session, userMsg);
-
-  // Get AI response
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini", // cheap + fast, perfect for this
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...session.history,
-    ],
-    temperature: 0.7,
-    max_tokens: 200,
-  });
-
-  let reply = response.choices[0].message.content;
-
-  // Check for special signals from AI
-  if (reply.includes("LEAD_CAPTURED")) {
-    reply = reply.replace("LEAD_CAPTURED", "").trim();
-    await saveLead(session.lead, phone);
-    await notifyCoach(session.lead); // notify Clara by email/WhatsApp
-  }
-
-  if (reply.includes("CALL_BOOKED")) {
-    reply = reply.replace("CALL_BOOKED", "").trim();
-    session.lead.status = "call_booked";
-    await saveLead(session.lead, phone);
-  }
-
-  // Add bot reply to history
-  session.history.push({ role: "assistant", content: reply });
-
-  return reply;
+async function addToHistory(phone, role, content) {
+    const session = sessions[phone];
+    if (session) {
+        session.history.push({ role, content });
+    }
+    await db.run("INSERT INTO history (phone, role, content) VALUES (?, ?, ?)", [phone, role, content]);
 }
 
-// ─── Simple lead info extractor ───────────────────────────────────────────────
-function extractLeadInfo(session, msg) {
-  // Email pattern
-  const emailMatch = msg.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-  if (emailMatch) session.lead.email = emailMatch[0];
-
-  // Phone pattern (basic)
-  const phoneMatch = msg.match(/(\+?\d[\d\s\-]{8,14}\d)/);
-  if (phoneMatch && !session.lead.phone) session.lead.phone = phoneMatch[0];
-
-  // If previous message asked for name, treat short reply as name
-  const history = session.history;
-  if (history.length >= 2) {
-    const prevBot = history[history.length - 2]?.content || "";
-    if (
-      prevBot.toLowerCase().includes("your name") &&
-      msg.length < 30 &&
-      !msg.includes("@")
-    ) {
-      session.lead.name = msg.trim();
+// ─── AI Tools Definition ─────────────────────────────────────────────────────
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "record_user_challenge",
+      description: "Record the user's primary business or mindset challenge.",
+      parameters: {
+        type: "object",
+        properties: {
+          challenge: { type: "string", description: "The detailed challenge the user is facing" }
+        },
+        required: ["challenge"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_user_identity",
+      description: "Update the user's name or email address.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The user's name" },
+          email: { type: "string", description: "The user's email address" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "mark_lead_captured",
+      description: "Finalize the lead capture when you have both name AND email.",
+      parameters: {
+        type: "object",
+        properties: {
+          final_note: { type: "string", description: "Summary of the lead" }
+        }
+      }
     }
   }
-}
+];
 
-// ─── Save lead (swap for your DB of choice) ───────────────────────────────────
+// ─── Coach persona ───────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `
+You are Coach Clara, a professional business and mindset coach.
+
+YOUR GOAL: Warmly guide the user to share their challenge, name, and email.
+
+CONVERSATION FLOW:
+1. GREET - Warm welcome.
+2. ASK CHALLENGE - Ask what's their biggest challenge.
+3. QUALIFY - Acknowledge the challenge and ask for their NAME.
+4. COLLECT EMAIL - Ask for their email to send a free guide.
+
+TOOLS:
+- Use 'record_user_challenge' as soon as the user describes their struggle.
+- Use 'update_user_identity' when they share their name or email.
+- Use 'mark_lead_captured' ONLY after collecting both Name AND Email.
+
+RULES:
+- ONE QUESTION AT A TIME.
+- Be concise but warm.
+`;
+
+// ─── Save lead (SQLite) ────────────────────────────────────────────────────────
 async function saveLead(lead, phone) {
   lead.phone = phone;
   lead.timestamp = new Date().toISOString();
-  lead.source = "whatsapp";
-
-  console.log("NEW LEAD:", lead);
-
-  // Option A: Save to Google Sheets via API
-  // await appendToSheet(lead);
-
-  // Option B: Save to Airtable
-  // await airtable('Leads').create(lead);
-
-  // Option C: Save to your own DB
-  // await db.collection('leads').insertOne(lead);
-}
-
-// ─── Notify coach (WhatsApp or email) ─────────────────────────────────────────
-async function notifyCoach(lead) {
-  // Send Clara a WhatsApp message with the lead details
-  // Using Twilio:
-  /*
-  await twilioClient.messages.create({
-    from: 'whatsapp:+14155238886',
-    to: `whatsapp:${process.env.COACH_PHONE}`,
-    body: `New lead!\nName: ${lead.name}\nEmail: ${lead.email}\nChallenge: ${lead.challenge}`
-  });
-  */
-  console.log("Notifying coach of new lead:", lead.name);
-}
-
-// ─── Twilio WhatsApp webhook ──────────────────────────────────────────────────
-app.post("/webhook", async (req, res) => {
-  const userMsg = req.body.Body?.trim();
-  const phone = req.body.From; // e.g. "whatsapp:+2348012345678"
-
-  if (!userMsg || !phone) {
-    return res.status(400).send("Bad request");
-  }
-
+  
   try {
-    const reply = await handleMessage(phone, userMsg);
-
-    // Twilio expects TwiML XML response
-    res.set("Content-Type", "text/xml");
-    res.send(`
-      <Response>
-        <Message>${reply}</Message>
-      </Response>
-    `);
-  } catch (err) {
-    console.error("Bot error:", err);
-    res.set("Content-Type", "text/xml");
-    res.send(`
-      <Response>
-        <Message>Sorry, I had a hiccup! Clara will reach out shortly.</Message>
-      </Response>
-    `);
+    const existing = await db.get("SELECT id FROM leads WHERE phone = ?", [phone]);
+    if (existing) {
+      await db.run(
+        "UPDATE leads SET name = ?, email = ?, challenge = ?, status = ? WHERE phone = ?",
+        [lead.name || "", lead.email || "", lead.challenge || "", lead.status || "ongoing", phone]
+      );
+    } else {
+      await db.run(
+        "INSERT INTO leads (phone, name, email, challenge, status) VALUES (?, ?, ?, ?, ?)",
+        [phone, lead.name || "", lead.email || "", lead.challenge || "", lead.status || "ongoing"]
+      );
+    }
+  } catch (error) {
+    console.error("Database save failed:", error);
   }
-});
+}
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.send("Coach bot is running ✓"));
+// ─── API Handlers ────────────────────────────────────────────────────────────
 
-// ─── Streamlit UI API Endpoints ───────────────────────────────────────────────
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", aiLimiter, async (req, res) => {
   const { message, phone } = req.body;
   const userPhone = phone || "streamlit-user";
-
-  if (!message) {
-    return res.status(400).json({ error: "Message required" });
-  }
+  if (!message) return res.status(400).json({ error: "Message required" });
 
   try {
-    const session = getSession(userPhone);
+    const session = await getSession(userPhone);
+    session.phone = userPhone;
     const pipelineSteps = [];
     
-    pipelineSteps.push({ step: "received", label: "Message Received", timestamp: new Date().toISOString() });
+    pipelineSteps.push({ step: "received", label: "Message Received", timestamp: new Date().toISOString(), details: { message } });
     
-    // Extract lead info
-    extractLeadInfo(session, message);
-    if (session.lead.email || session.lead.name) {
-      pipelineSteps.push({ step: "extracted", label: "Data Extracted", details: session.lead, timestamp: new Date().toISOString() });
+    // Add to SQLite history immediately
+    await addToHistory(userPhone, "user", message);
+
+    // AI Call with Tool Use Loop
+    let assistantMsg;
+    let toolCallsProcessed = 0;
+    let toolWasCalled = false;
+    
+    // We loop up to 3 times to allow for multiple tool calls or a final response
+    while (toolCallsProcessed < 3) {
+        const response = await openai.chat.completions.create({
+            model: "deepseek-chat",
+            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history],
+            tools: tools,
+            tool_choice: "auto"
+        });
+
+        assistantMsg = response.choices[0].message;
+        
+        if (assistantMsg.tool_calls) {
+            toolWasCalled = true;
+            session.history.push(assistantMsg); // Add the assistant's request to call tools
+
+            for (const toolCall of assistantMsg.tool_calls) {
+                const args = JSON.parse(toolCall.function.arguments);
+                
+                if (toolCall.function.name === "record_user_challenge") {
+                    session.lead.challenge = args.challenge;
+                    pipelineSteps.push({ step: "extracted", label: "Challenge Recorded", details: args, timestamp: new Date().toISOString() });
+                }
+                
+                if (toolCall.function.name === "update_user_identity") {
+                    if (args.name) session.lead.name = args.name;
+                    if (args.email) session.lead.email = args.email;
+                    pipelineSteps.push({ step: "extracted", label: "Identity Updated", details: args, timestamp: new Date().toISOString() });
+                }
+                
+                if (toolCall.function.name === "mark_lead_captured") {
+                    session.lead.status = "lead_captured";
+                    pipelineSteps.push({ step: "stored", label: "Lead Finalized", details: args, timestamp: new Date().toISOString() });
+                }
+
+                // Add tool result to history
+                session.history.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "Action successful."
+                });
+            }
+            
+            await saveLead(session.lead, userPhone);
+            toolCallsProcessed++;
+            continue; // Go back for the model to generate a text response
+        } else {
+            break; // No tool calls, we have our final text response
+        }
     }
 
-    // Get AI response
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...session.history,
-      ],
-      temperature: 0.7,
-      max_tokens: 200,
-    });
+    let reply = assistantMsg.content || "I've noted that down. What's next?";
+    
+    // Clean up any leaked DeepSeek internal tokens
+    reply = reply.replace(/<｜DSML｜.*?>/gs, "").trim();
+    
+    // Final assistant reply to SQLite
+    await addToHistory(userPhone, "assistant", reply);
 
-    let reply = response.choices[0].message.content;
-    pipelineSteps.push({ step: "reasoning", label: "Agent Reasoning", details: "Generated response", timestamp: new Date().toISOString() });
-
-    // Check for lead capture or call booking
+    // Determine stage
     let status = "ongoing";
-    if (reply.includes("LEAD_CAPTURED")) {
-      reply = reply.replace("LEAD_CAPTURED", "").trim();
-      await saveLead(session.lead, userPhone);
-      await notifyCoach(session.lead);
-      pipelineSteps.push({ step: "stored", label: "Lead Stored", details: session.lead, timestamp: new Date().toISOString() });
-      pipelineSteps.push({ step: "notified", label: "Coach Notified", details: { name: session.lead.name, email: session.lead.email }, timestamp: new Date().toISOString() });
-      status = "lead_captured";
+    if (session.lead.name && session.lead.email) {
+        session.stage = "Lead Captured";
+        status = "lead_captured";
+    } else if (session.lead.name) {
+        session.stage = "Collecting Email";
+    } else if (session.lead.challenge) {
+        session.stage = "Collecting Name";
+    } else {
+        session.stage = "Asking Challenge";
     }
 
-    if (reply.includes("CALL_BOOKED")) {
-      reply = reply.replace("CALL_BOOKED", "").trim();
-      session.lead.status = "call_booked";
-      await saveLead(session.lead, userPhone);
-      pipelineSteps.push({ step: "stored", label: "Call Booked", details: session.lead, timestamp: new Date().toISOString() });
-      pipelineSteps.push({ step: "notified", label: "Coach Notified", details: { name: session.lead.name }, timestamp: new Date().toISOString() });
-      status = "call_booked";
-    }
+    // Reasoning & Confidence
+    const confidence = toolWasCalled ? "0.98" : "0.75";
+    const reasoning = toolWasCalled ? "AI updated lead data and generated a contextual response." : "Engaging in natural conversation flow.";
 
-    // Add to history
-    session.history.push({ role: "user", content: message });
-    session.history.push({ role: "assistant", content: reply });
+    pipelineSteps.push({ step: "reasoning", label: "Agent Reasoning", details: reasoning, timestamp: new Date().toISOString() });
 
     res.json({
       reply,
       lead: session.lead,
       pipeline: pipelineSteps,
       status,
-      history: session.history
+      history: session.history,
+      stage: session.stage,
+      reasoning,
+      confidence
     });
   } catch (err) {
     console.error("Bot error:", err);
@@ -244,18 +327,81 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-app.get("/api/session/:phone", (req, res) => {
-  const { phone } = req.params;
-  const session = getSession(phone);
-  res.json(session);
+// ─── Twilio WhatsApp webhook (kept for compatibility) ────────────────────────
+app.post("/webhook", aiLimiter, async (req, res) => {
+  const userMsg = req.body.Body?.trim();
+  const phone = req.body.From;
+  if (!userMsg || !phone) return res.status(400).send("Bad request");
+
+  try {
+    const session = await getSession(phone);
+    session.phone = phone;
+    session.history.push({ role: "user", content: userMsg });
+
+    const response = await openai.chat.completions.create({
+      model: "deepseek-chat",
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history],
+      tools: tools,
+      tool_choice: "auto"
+    });
+
+    let assistantMsg = response.choices[0].message;
+
+    if (assistantMsg.tool_calls) {
+      for (const toolCall of assistantMsg.tool_calls) {
+        const args = JSON.parse(toolCall.function.arguments);
+        if (toolCall.function.name === "record_user_challenge") {
+          session.lead.challenge = args.challenge;
+        }
+        if (toolCall.function.name === "update_user_identity") {
+          if (args.name) session.lead.name = args.name;
+          if (args.email) session.lead.email = args.email;
+        }
+        if (toolCall.function.name === "mark_lead_captured") {
+          session.lead.status = "lead_captured";
+        }
+      }
+      await saveLead(session.lead, phone);
+
+      const secondResponse = await openai.chat.completions.create({
+        model: "deepseek-chat",
+        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history],
+      });
+      assistantMsg = secondResponse.choices[0].message;
+    }
+
+    const reply = assistantMsg.content || "Noted!";
+    session.history.push({ role: "assistant", content: reply });
+
+    res.set("Content-Type", "text/xml");
+    res.send(`<Response><Message>${reply}</Message></Response>`);
+  } catch (err) {
+    console.error("Webhook error:", err);
+    res.set("Content-Type", "text/xml");
+    res.send(`<Response><Message>Sorry, I had a hiccup!</Message></Response>`);
+  }
 });
 
-app.get("/api/sessions", (req, res) => {
-  res.json(Object.keys(sessions).map(phone => ({
-    phone,
-    lead: sessions[phone].lead,
-    step: sessions[phone].step
-  })));
+app.get("/api/session/:phone", async (req, res) => {
+  try {
+    const session = await getSession(req.params.phone);
+    res.json({
+      lead: session.lead,
+      stage: session.stage,
+      history: session.history
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Session load error" });
+  }
+});
+
+app.get("/api/leads", async (req, res) => {
+  try {
+    const leads = await db.all("SELECT * FROM leads ORDER BY timestamp DESC");
+    res.json(leads);
+  } catch (err) {
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 const PORT = process.env.PORT || 3000;

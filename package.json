@@ -8,7 +8,11 @@
     "streamlit": "streamlit run streamlit_app.py"
   },
   "dependencies": {
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "openai": "^4.20.0"
+    "express-rate-limit": "^8.3.2",
+    "openai": "^4.20.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1"
   }
 }

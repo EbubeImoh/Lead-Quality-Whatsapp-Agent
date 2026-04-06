@@ -1,154 +1,321 @@
 import streamlit as st
 import requests
-import time
+import json
+import pandas as pd
+import uuid
 from datetime import datetime
 
 API_BASE = "http://localhost:3000"
 
 st.set_page_config(page_title="Coach Clara - Lead Qualifier", layout="wide", page_icon="💬")
 
+# Initialize session state
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if "credits_remaining" not in st.session_state:
+    st.session_state.credits_remaining = 5
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
 if "pipeline" not in st.session_state:
     st.session_state.pipeline = []
-
 if "lead_data" not in st.session_state:
     st.session_state.lead_data = {}
+if "stage" not in st.session_state:
+    st.session_state.stage = "Initial Contact"
+if "confidence" not in st.session_state:
+    st.session_state.confidence = "0.00"
+if "reasoning" not in st.session_state:
+    st.session_state.reasoning = ""
+if "debug" not in st.session_state:
+    st.session_state.debug = False
+if "initialized" not in st.session_state:
+    st.session_state.initialized = False
 
-if "current_thought" not in st.session_state:
-    st.session_state.current_thought = ""
+def sync_with_backend():
+    try:
+        # Fetch session state
+        resp = requests.get(f"{API_BASE}/api/session/{st.session_state.session_id}")
+        if resp.status_code == 200:
+            data = resp.json()
+            st.session_state.lead_data = data.get("lead", {})
+            st.session_state.stage = data.get("stage", "Initial Contact")
+            # Convert history to streamlit format if needed
+            db_history = data.get("history", [])
+            if db_history and not st.session_state.messages:
+                st.session_state.messages = db_history
+                
+        # Fetch credits by sending a dummy HEAD/GET to a limited endpoint
+        # We'll use a specific credits check if possible, or just parse from any response
+        # For now, we'll initialize with 5 and update on first message or add a check
+    except:
+        pass
+
+if not st.session_state.initialized:
+    sync_with_backend()
+    st.session_state.initialized = True
+
+# Custom CSS
+st.markdown("""
+<style>
+    /* Global Background */
+    .stApp {
+        background-color: #000000;
+        color: #e2e8f0;
+    }
+    
+    .credit-counter {
+        position: fixed;
+        top: 70px;
+        right: 20px;
+        background: #111111;
+        color: #ffffff;
+        padding: 8px 16px;
+        border-radius: 20px;
+        font-weight: 700;
+        font-size: 0.85rem;
+        z-index: 1000;
+        border: 2px solid #3b82f6;
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+    }
+    
+    /* Main container styling */
+    .main { 
+        background-color: #000000; 
+    }
+    
+    /* Chat message styling */
+    .stChatMessage { 
+        background-color: #111111 !important;
+        border: 1px solid #222222;
+        border-radius: 15px; 
+        padding: 15px; 
+        margin-bottom: 10px; 
+    }
+    
+    /* Insight Card Styling */
+    .insight-card { 
+        background: #111111; 
+        border-radius: 12px; 
+        padding: 20px; 
+        margin-bottom: 20px; 
+        border: 1px solid #222222; 
+        color: #ffffff;
+    }
+    
+    .section-header { 
+        font-size: 0.85rem; 
+        font-weight: 700; 
+        color: #94a3b8; 
+        text-transform: uppercase; 
+        letter-spacing: 0.05em; 
+        margin-bottom: 12px; 
+        display: flex; 
+        align-items: center; 
+    }
+    
+    .entity-tag { 
+        display: inline-block; 
+        padding: 4px 12px; 
+        border-radius: 6px; 
+        font-size: 0.85rem; 
+        margin-right: 8px; 
+        margin-bottom: 8px; 
+        background: #1e293b; 
+        border: 1px solid #334155; 
+        color: #cbd5e1;
+    }
+    
+    .entity-label { 
+        font-weight: 600; 
+        color: #3b82f6; 
+        margin-right: 4px; 
+    }
+    
+    .stage-badge { 
+        background: #1e3a8a; 
+        color: #bfdbfe; 
+        padding: 4px 12px; 
+        border-radius: 20px; 
+        font-weight: 600; 
+        font-size: 0.8rem; 
+    }
+    
+    .confidence-meter { 
+        height: 8px; 
+        background: #1e293b; 
+        border-radius: 4px; 
+        margin-top: 8px; 
+        overflow: hidden; 
+    }
+    
+    .confidence-fill { 
+        height: 100%; 
+        background: linear-gradient(90deg, #3b82f6, #2563eb); 
+        border-radius: 4px; 
+        transition: width 0.5s ease-in-out; 
+    }
+    
+    .pipeline-item { 
+        border-left: 2px solid #334155; 
+        padding-left: 15px; 
+        padding-bottom: 15px; 
+        position: relative; 
+    }
+    
+    .pipeline-item::before { 
+        content: ''; 
+        position: absolute; 
+        left: -5px; 
+        top: 0; 
+        width: 8px; 
+        height: 8px; 
+        border-radius: 50%; 
+        background: #3b82f6; 
+    }
+    
+    .scroll-container { 
+        max-height: 300px; 
+        overflow-y: auto; 
+        padding-right: 10px; 
+    }
+
+    /* Override Streamlit text colors for visibility */
+    h1, h2, h3, p, span, label {
+        color: #f1f5f9 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Render Credit Counter at top right
+st.markdown(f'<div class="credit-counter">🔋 Daily Credits: {st.session_state.credits_remaining} / 5</div>', unsafe_allow_html=True)
 
 def send_message(message):
     try:
         response = requests.post(
             f"{API_BASE}/api/chat",
-            json={"message": message, "phone": "streamlit-user"},
+            json={"message": message, "phone": st.session_state.session_id},
             timeout=30
         )
-        if response.status_code == 200:
-            data = response.json()
-            return data
+        # Update credits from headers
+        rem = response.headers.get("X-RateLimit-Remaining")
+        if rem is not None:
+            st.session_state.credits_remaining = int(rem)
+
+        if response.status_code in [200, 429]:
+            return response.json()
         else:
             st.error(f"Error: {response.status_code}")
             return None
-    except requests.exceptions.ConnectionError:
-        st.error("Cannot connect to backend. Make sure the Node.js server is running.")
-        return None
     except Exception as e:
         st.error(f"Error: {str(e)}")
         return None
 
-def get_step_color(step):
-    colors = {
-        "received": "#6366f1",
-        "extracted": "#8b5cf6",
-        "reasoning": "#06b6d4",
-        "stored": "#10b981",
-        "notified": "#f59e0b"
-    }
-    return colors.get(step, "#6b7280")
+def get_leads():
+    try:
+        response = requests.get(f"{API_BASE}/api/leads")
+        return response.json()
+    except:
+        return []
 
-def render_pipeline():
-    st.subheader("📊 Pipeline")
-    
-    if not st.session_state.pipeline:
-        st.info("Start chatting to see the pipeline in action!")
-        return
-    
-    for i, step in enumerate(st.session_state.pipeline):
-        step_color = get_step_color(step["step"])
+# --- UI Layout ---
+st.title("🏃 Coach Clara Admin")
+
+tab1, tab2 = st.tabs(["💬 Live Agent", "📊 Lead Database"])
+
+with tab1:
+    col_chat, col_insights = st.columns([1.8, 1], gap="large")
+
+    with col_chat:
+        st.subheader("Live Chat")
+        chat_placeholder = st.container(height=500)
+        with chat_placeholder:
+            if not st.session_state.messages:
+                st.info("Start a conversation to see the agent in action.")
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+        user_input = st.chat_input("Message Coach Clara...")
+        if user_input:
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            with st.spinner("Agent processing..."):
+                result = send_message(user_input)
+            if result:
+                st.session_state.messages.append({"role": "assistant", "content": result["reply"]})
+                st.session_state.pipeline = result.get("pipeline", [])
+                st.session_state.lead_data = result.get("lead", {})
+                st.session_state.stage = result.get("stage", "Ongoing")
+                st.session_state.confidence = result.get("confidence", "0.00")
+                st.session_state.reasoning = result.get("reasoning", "")
+                if result.get("status") == "lead_captured":
+                    st.toast("Lead Captured!", icon="🎉")
+                st.rerun()
+
+    with col_insights:
+        st.subheader("Agent Insights")
         
-        with st.container():
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                st.markdown(
-                    f"""
-                    <div style="
-                        background-color: {step_color};
-                        color: white;
-                        padding: 8px 12px;
-                        border-radius: 20px;
-                        text-align: center;
-                        font-weight: bold;
-                        font-size: 12px;
-                    ">
-                        {step["label"]}
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-            with col2:
-                if "details" in step and step["details"]:
-                    details_str = str(step["details"])[:100]
-                    st.caption(details_str)
-                else:
-                    st.caption("✓ Completed")
-            
-            if i < len(st.session_state.pipeline) - 1:
-                st.markdown(
-                    "<div style='padding-left: 15px; border-left: 2px solid #e5e7eb; margin: 5px 0;'>",
-                    unsafe_allow_html=True
-                )
+        # Live Reasoning
+        st.markdown(f"""
+        <div class="insight-card">
+            <div class="section-header">🧠 Live Reasoning</div>
+            <p style="font-size: 0.9rem; color: #334155; font-style: italic;">"{st.session_state.reasoning or 'Waiting for input...'}"</p>
+            <div style="margin-top: 15px;">
+                <div style="display: flex; justify-content: space-between; font-size: 0.75rem; font-weight: 600;">
+                    <span>CONFIDENCE</span>
+                    <span>{float(st.session_state.confidence)*100:.0f}%</span>
+                </div>
+                <div class="confidence-meter">
+                    <div class="confidence-fill" style="width: {float(st.session_state.confidence)*100}%"></div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-def render_lead_data():
-    st.subheader("👤 Lead Data")
-    
-    if not st.session_state.lead_data:
-        st.info("No lead data collected yet")
-        return
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Name", st.session_state.lead_data.get("name", "—"))
-    with col2:
-        st.metric("Status", st.session_state.lead_data.get("status", "New"))
-    
-    with st.expander("Full Details"):
-        st.json(st.session_state.lead_data)
+        # Conversation State
+        st.markdown(f"""
+        <div class="insight-card">
+            <div class="section-header">📍 Conversation Stage</div>
+            <span class="stage-badge">{st.session_state.stage}</span>
+            <div style="margin-top: 15px;">
+                <div class="section-header" style="font-size: 0.7rem;">EXTRACTED ENTITIES</div>
+                <div class="entity-tag"><span class="entity-label">Name:</span> {st.session_state.lead_data.get('name', '—')}</div>
+                <div class="entity-tag"><span class="entity-label">Email:</span> {st.session_state.lead_data.get('email', '—')}</div>
+                <div class="entity-tag"><span class="entity-label">Challenge:</span> {"Captured" if st.session_state.lead_data.get('challenge') else '—'}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-col1, col2 = st.columns([2, 1], gap="large")
+        # Activity Log (Scrollable)
+        st.markdown('<div class="section-header">🔄 Activity Log</div>', unsafe_allow_html=True)
+        with st.container(height=300):
+            if not st.session_state.pipeline:
+                st.write("No activity yet.")
+            for step in reversed(st.session_state.pipeline):
+                st.markdown(f"""
+                <div class="pipeline-item">
+                    <span style="font-size: 0.7rem; color: #94a3b8;">{step['timestamp'].split('T')[1][:8]}</span><br/>
+                    <b>{step['label']}</b><br/>
+                    <span style="font-size: 0.8rem; color: #64748b;">{json.dumps(step['details']) if step.get('details') else ''}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
-with col1:
-    st.title("💬 Coach Clara")
-    st.caption("AI Lead Qualifier - WhatsApp Agent")
-    
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-    
-    user_input = st.chat_input("Type your message...")
-    
-    if user_input:
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
-        
-        with st.spinner("Thinking..."):
-            result = send_message(user_input)
-        
-        if result:
-            st.session_state.current_thought = result.get("reply", "")
-            st.session_state.messages.append({"role": "assistant", "content": st.session_state.current_thought})
-            st.session_state.pipeline = result.get("pipeline", [])
-            st.session_state.lead_data = result.get("lead", {})
+with tab2:
+    st.subheader("Captured Leads (SQLite)")
+    if st.button("🔄 Refresh Database"):
+        leads = get_leads()
+        if leads:
+            df = pd.DataFrame(leads)
+            st.dataframe(df, use_container_width=True)
             
-            with st.chat_message("assistant"):
-                st.markdown(st.session_state.current_thought)
-            
-            if result.get("status") == "lead_captured":
-                st.success("🎉 Lead captured and notified!")
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Export CSV", csv, "leads.csv", "text/csv")
         else:
-            st.session_state.messages.pop()
+            st.info("No leads found in database.")
+    else:
+        leads = get_leads()
+        if leads:
+            st.dataframe(pd.DataFrame(leads), use_container_width=True)
 
-with col2:
-    st.markdown("### 🤖 Agent Insights")
-    
-    if st.session_state.current_thought:
-        st.info(st.session_state.current_thought)
-    
-    render_pipeline()
-    render_lead_data()
-
-st.markdown("---")
-st.caption("Made with Streamlit • Connected to Node.js backend")
+if st.session_state.debug:
+    st.divider()
+    st.json(st.session_state.to_dict())
