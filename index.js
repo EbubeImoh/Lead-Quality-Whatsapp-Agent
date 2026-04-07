@@ -14,6 +14,11 @@ dotenv.config();
 
 const app = express();
 
+// Helper to get client IP
+const getClientIp = (req) => {
+  return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+};
+
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 100, 
@@ -29,7 +34,7 @@ const aiLimiter = rateLimit({
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
   keyGenerator: (req) => {
-    return req.body.phone || req.query.phone || req.ip;
+    return getClientIp(req);
   },
   handler: (req, res) => {
     res.status(429).json({ 
@@ -245,7 +250,8 @@ async function saveLead(lead, phone) {
 
 app.post("/api/chat", aiLimiter, async (req, res) => {
   const { message, phone } = req.body;
-  const userPhone = phone || "streamlit-user";
+  // Use IP for Web UI persistence
+  const userPhone = getClientIp(req);
   if (!message) return res.status(400).json({ error: "Message required" });
 
   try {
@@ -371,43 +377,62 @@ app.post("/webhook", aiLimiter, async (req, res) => {
   try {
     const session = await getSession(phone);
     session.phone = phone;
-    session.history.push({ role: "user", content: userMsg });
-
-    const response = await openai.chat.completions.create({
-      model: "deepseek-chat",
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history],
-      tools: tools,
-      tool_choice: "auto"
-    });
-
-    let assistantMsg = response.choices[0].message;
-
-    if (assistantMsg.tool_calls) {
-      for (const toolCall of assistantMsg.tool_calls) {
-        const args = JSON.parse(toolCall.function.arguments);
-        if (toolCall.function.name === "record_user_challenge") {
-          session.lead.challenge = args.challenge;
-        }
-        if (toolCall.function.name === "update_user_identity") {
-          if (args.name) session.lead.name = args.name;
-          if (args.email) session.lead.email = args.email;
-        }
-        if (toolCall.function.name === "mark_lead_captured") {
-          session.lead.status = "lead_captured";
-        }
-      }
-      await saveLead(session.lead, phone);
-
-      const secondResponse = await openai.chat.completions.create({
-        model: "deepseek-chat",
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history],
-      });
-      assistantMsg = secondResponse.choices[0].message;
+    
+    // Check credits for WhatsApp users too
+    const remaining = await checkAndConsumeCredit(phone);
+    if (remaining === -1) {
+        await sendWhatsAppMessage(phone, "Whoa there! 🏎️ You've used up your daily credits. Contact ebubeimoh@gmail.com to build a system like this for your business!");
+        return res.status(200).send("OK");
     }
 
-    const reply = assistantMsg.content || "Noted!";
-    session.history.push({ role: "assistant", content: reply });
+    await addToHistory(phone, "user", userMsg);
 
+    // AI Call with Tool Use Loop
+    let assistantMsg;
+    let toolCallsProcessed = 0;
+    
+    while (toolCallsProcessed < 3) {
+        const response = await openai.chat.completions.create({
+            model: "deepseek-chat",
+            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history],
+            tools: tools,
+            tool_choice: "auto"
+        });
+
+        assistantMsg = response.choices[0].message;
+        
+        if (assistantMsg.tool_calls) {
+            session.history.push(assistantMsg);
+            for (const toolCall of assistantMsg.tool_calls) {
+                const args = JSON.parse(toolCall.function.arguments);
+                if (toolCall.function.name === "record_user_challenge") {
+                    session.lead.challenge = args.challenge;
+                }
+                if (toolCall.function.name === "update_user_identity") {
+                    if (args.name) session.lead.name = args.name;
+                    if (args.email) session.lead.email = args.email;
+                }
+                if (toolCall.function.name === "mark_lead_captured") {
+                    session.lead.status = "lead_captured";
+                }
+                session.history.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "Action successful."
+                });
+            }
+            await saveLead(session.lead, phone);
+            toolCallsProcessed++;
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    let reply = assistantMsg.content || "I've noted that down.";
+    reply = reply.replace(/<｜DSML｜.*?>/gs, "").trim();
+    
+    await addToHistory(phone, "assistant", reply);
     await sendWhatsAppMessage(phone, reply);
 
     res.json({ object: "whatsapp_business_account", entry: [] });
