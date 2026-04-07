@@ -1,0 +1,12 @@
+{
+  "name": "lead-quality-whatsapp-agent",
+  "version": "1.0.0",
+  "runtime": "node",
+  "build": {
+    "runtime": "node",
+    "installCommand": "npm install"
+  },
+  "deploy": {
+    "command": "node index.js"
+  }
+}

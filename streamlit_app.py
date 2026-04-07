@@ -5,7 +5,7 @@ import pandas as pd
 import uuid
 from datetime import datetime
 
-API_BASE = "http://localhost:3000"
+API_BASE = st.secrets.get("API_BASE", "http://localhost:3000")
 
 st.set_page_config(page_title="Coach Clara - Lead Qualifier", layout="wide", page_icon="💬")
 
@@ -34,19 +34,19 @@ if "initialized" not in st.session_state:
 def sync_with_backend():
     try:
         # Fetch session state
-        resp = requests.get(f"{API_BASE}/api/session/{st.session_state.session_id}")
+        resp = requests.get(f"{API_BASE}/api/session/{st.session_state.session_id}", timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             st.session_state.lead_data = data.get("lead", {})
             st.session_state.stage = data.get("stage", "Initial Contact")
-            # Convert history to streamlit format if needed
             db_history = data.get("history", [])
             if db_history and not st.session_state.messages:
                 st.session_state.messages = db_history
-                
-        # Fetch credits by sending a dummy HEAD/GET to a limited endpoint
-        # We'll use a specific credits check if possible, or just parse from any response
-        # For now, we'll initialize with 5 and update on first message or add a check
+        
+        # Fetch credits
+        c_resp = requests.get(f"{API_BASE}/api/credits/{st.session_state.session_id}", timeout=5)
+        if c_resp.status_code == 200:
+            st.session_state.credits_remaining = c_resp.json().get("remaining", 5)
     except:
         pass
 
@@ -57,55 +57,49 @@ if not st.session_state.initialized:
 # Custom CSS
 st.markdown("""
 <style>
-    /* Global Background */
+    /* Default Light Mode Styles */
     .stApp {
-        background-color: #000000;
-        color: #e2e8f0;
+        background-color: #ffffff;
+        color: #1e293b;
     }
     
     .credit-counter {
         position: fixed;
         top: 70px;
         right: 20px;
-        background: #111111;
-        color: #ffffff;
+        background: #ffffff;
+        color: #1e293b;
         padding: 8px 16px;
         border-radius: 20px;
         font-weight: 700;
         font-size: 0.85rem;
         z-index: 1000;
         border: 2px solid #3b82f6;
-        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.1);
     }
     
-    /* Main container styling */
-    .main { 
-        background-color: #000000; 
-    }
-    
-    /* Chat message styling */
     .stChatMessage { 
-        background-color: #111111 !important;
-        border: 1px solid #222222;
+        background-color: #f8fafc !important;
+        border: 1px solid #e2e8f0;
         border-radius: 15px; 
         padding: 15px; 
         margin-bottom: 10px; 
     }
     
-    /* Insight Card Styling */
     .insight-card { 
-        background: #111111; 
+        background: #ffffff; 
         border-radius: 12px; 
         padding: 20px; 
         margin-bottom: 20px; 
-        border: 1px solid #222222; 
-        color: #ffffff;
+        border: 1px solid #e2e8f0; 
+        color: #1e293b;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
     
     .section-header { 
         font-size: 0.85rem; 
         font-weight: 700; 
-        color: #94a3b8; 
+        color: #64748b; 
         text-transform: uppercase; 
         letter-spacing: 0.05em; 
         margin-bottom: 12px; 
@@ -120,9 +114,9 @@ st.markdown("""
         font-size: 0.85rem; 
         margin-right: 8px; 
         margin-bottom: 8px; 
-        background: #1e293b; 
-        border: 1px solid #334155; 
-        color: #cbd5e1;
+        background: #f1f5f9; 
+        border: 1px solid #e2e8f0; 
+        color: #475569;
     }
     
     .entity-label { 
@@ -132,8 +126,8 @@ st.markdown("""
     }
     
     .stage-badge { 
-        background: #1e3a8a; 
-        color: #bfdbfe; 
+        background: #dbeafe; 
+        color: #1e40af; 
         padding: 4px 12px; 
         border-radius: 20px; 
         font-weight: 600; 
@@ -142,7 +136,7 @@ st.markdown("""
     
     .confidence-meter { 
         height: 8px; 
-        background: #1e293b; 
+        background: #f1f5f9; 
         border-radius: 4px; 
         margin-top: 8px; 
         overflow: hidden; 
@@ -156,7 +150,7 @@ st.markdown("""
     }
     
     .pipeline-item { 
-        border-left: 2px solid #334155; 
+        border-left: 2px solid #e2e8f0; 
         padding-left: 15px; 
         padding-bottom: 15px; 
         position: relative; 
@@ -172,16 +166,49 @@ st.markdown("""
         border-radius: 50%; 
         background: #3b82f6; 
     }
-    
+
+    /* Dark Mode Overrides */
+    @media (prefers-color-scheme: dark) {
+        .stApp {
+            background-color: #000000;
+            color: #e2e8f0;
+        }
+        .credit-counter {
+            background: #111111;
+            color: #ffffff;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
+        .stChatMessage { 
+            background-color: #111111 !important;
+            border: 1px solid #222222;
+        }
+        .insight-card { 
+            background: #111111; 
+            border: 1px solid #222222; 
+            color: #ffffff;
+        }
+        .section-header { color: #94a3b8; }
+        .entity-tag { 
+            background: #1e293b; 
+            border: 1px solid #334155; 
+            color: #cbd5e1;
+        }
+        .stage-badge { 
+            background: #1e3a8a; 
+            color: #bfdbfe; 
+        }
+        .confidence-meter { background: #1e293b; }
+        .pipeline-item { border-left: 2px solid #334155; }
+        
+        h1, h2, h3, p, span, label {
+            color: #f1f5f9 !important;
+        }
+    }
+
     .scroll-container { 
         max-height: 300px; 
         overflow-y: auto; 
         padding-right: 10px; 
-    }
-
-    /* Override Streamlit text colors for visibility */
-    h1, h2, h3, p, span, label {
-        color: #f1f5f9 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -196,13 +223,17 @@ def send_message(message):
             json={"message": message, "phone": st.session_state.session_id},
             timeout=30
         )
-        # Update credits from headers
-        rem = response.headers.get("X-RateLimit-Remaining")
-        if rem is not None:
-            st.session_state.credits_remaining = int(rem)
-
+        # Update credits from JSON body first, then headers
+        data = None
         if response.status_code in [200, 429]:
-            return response.json()
+            data = response.json()
+            if data.get("remaining") is not None:
+                st.session_state.credits_remaining = data["remaining"]
+            else:
+                rem = response.headers.get("X-RateLimit-Remaining")
+                if rem is not None:
+                    st.session_state.credits_remaining = int(rem)
+            return data
         else:
             st.error(f"Error: {response.status_code}")
             return None
@@ -212,8 +243,10 @@ def send_message(message):
 
 def get_leads():
     try:
-        response = requests.get(f"{API_BASE}/api/leads")
-        return response.json()
+        response = requests.get(f"{API_BASE}/api/leads", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        return []
     except:
         return []
 
@@ -237,11 +270,17 @@ with tab1:
 
         user_input = st.chat_input("Message Coach Clara...")
         if user_input:
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            with st.spinner("Agent processing..."):
-                result = send_message(user_input)
-            if result:
-                st.session_state.messages.append({"role": "assistant", "content": result["reply"]})
+            if st.session_state.credits_remaining <= 0:
+                st.error("Daily credits exhausted. Contact ebubeimoh@gmail.com for a custom system! 😉")
+            else:
+                st.session_state.messages.append({"role": "user", "content": user_input})
+                # Local countdown for realtime feel
+                st.session_state.credits_remaining -= 1
+                
+                with st.spinner("Agent processing..."):
+                    result = send_message(user_input)
+                if result:
+                    st.session_state.messages.append({"role": "assistant", "content": result["reply"]})
                 st.session_state.pipeline = result.get("pipeline", [])
                 st.session_state.lead_data = result.get("lead", {})
                 st.session_state.stage = result.get("stage", "Ongoing")

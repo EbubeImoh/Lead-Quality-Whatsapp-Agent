@@ -1,3 +1,6 @@
+# Streamlit
+.streamlit/
+
 # Logs
 logs
 *.log
@@ -137,3 +140,10 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# SQLite
+database.sqlite
+database.sqlite-journal
+database.sqlite-shm
+database.sqlite-wal
+

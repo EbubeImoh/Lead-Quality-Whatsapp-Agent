@@ -49,7 +49,7 @@ app.use(generalLimiter);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY;
 const openai = new OpenAI({
     apiKey: DEEPSEEK_API_KEY,
     baseURL: "https://api.deepseek.com/v1"
@@ -84,11 +84,51 @@ let db;
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS credits (
+      phone TEXT PRIMARY KEY,
+      remaining INTEGER DEFAULT 5,
+      last_reset DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
   console.log("Database initialized successfully.");
 })();
 
 // ─── In-memory session store (backed by SQLite) ──────────────────────────────
 const sessions = {};
+
+async function checkAndConsumeCredit(phone) {
+    let row = await db.get("SELECT * FROM credits WHERE phone = ?", [phone]);
+    const now = new Date();
+    
+    if (!row) {
+        await db.run("INSERT INTO credits (phone, remaining, last_reset) VALUES (?, 4, ?)", [phone, now.toISOString()]);
+        return 4;
+    }
+    
+    const lastReset = new Date(row.last_reset);
+    const diffHours = (now - lastReset) / (1000 * 60 * 60);
+    
+    if (diffHours >= 24) {
+        await db.run("UPDATE credits SET remaining = 4, last_reset = ? WHERE phone = ?", [now.toISOString(), phone]);
+        return 4;
+    }
+    
+    if (row.remaining <= 0) return -1;
+    
+    const newRemaining = row.remaining - 1;
+    await db.run("UPDATE credits SET remaining = ? WHERE phone = ?", [newRemaining, phone]);
+    return newRemaining;
+}
+
+async function getRemainingCredits(phone) {
+    let row = await db.get("SELECT * FROM credits WHERE phone = ?", [phone]);
+    if (!row) return 5;
+    const now = new Date();
+    const lastReset = new Date(row.last_reset);
+    if ((now - lastReset) / (1000 * 60 * 60) >= 24) return 5;
+    return row.remaining;
+}
 
 async function getSession(phone) {
   if (!sessions[phone]) {
@@ -220,6 +260,19 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
   if (!message) return res.status(400).json({ error: "Message required" });
 
   try {
+    // 1. Credit Check from DB
+    const remaining = await checkAndConsumeCredit(userPhone);
+    if (remaining === -1) {
+        return res.status(429).json({ 
+            reply: "Whoa there, speed racer! 🏎️ You've used up your 5 daily credits. Coach Clara needs a coffee break, and so does my API quota. \n\n**Love this system?** I can build one for your business too! Reach out to my creator at **ebubeimoh@gmail.com** and let's automate your hustle. 😉",
+            error: "Rate limit exceeded",
+            reasoning: "Rate limit reached. Creator contact recommended.",
+            confidence: "1.00",
+            stage: "Limit Reached",
+            remaining: 0
+        });
+    }
+
     const session = await getSession(userPhone);
     session.phone = userPhone;
     const pipelineSteps = [];
@@ -319,7 +372,8 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
       history: session.history,
       stage: session.stage,
       reasoning,
-      confidence
+      confidence,
+      remaining: await getRemainingCredits(userPhone)
     });
   } catch (err) {
     console.error("Bot error:", err);
@@ -379,6 +433,15 @@ app.post("/webhook", aiLimiter, async (req, res) => {
     console.error("Webhook error:", err);
     res.set("Content-Type", "text/xml");
     res.send(`<Response><Message>Sorry, I had a hiccup!</Message></Response>`);
+  }
+});
+
+app.get("/api/credits/:phone", async (req, res) => {
+  try {
+    const remaining = await getRemainingCredits(req.params.phone);
+    res.json({ remaining });
+  } catch (err) {
+    res.status(500).json({ error: "Credit fetch error" });
   }
 });
 
