@@ -1,11 +1,11 @@
 import express from "express";
 import dotenv from "dotenv";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
+import initSqlJs from "sql.js";
 import path from "path";
 import { fileURLToPath } from 'url';
 import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
+import fs from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,7 +14,6 @@ dotenv.config();
 
 const app = express();
 
-// ─── Rate Limiting Security Layer ─────────────────────────────────────────────
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 100, 
@@ -24,14 +23,12 @@ const generalLimiter = rateLimit({
 });
 
 const aiLimiter = rateLimit({
-  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  windowMs: 24 * 60 * 60 * 1000,
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  validate: { xForwardedForHeader: false }, // Suppress trust proxy warnings if not needed
+  validate: { xForwardedForHeader: false },
   keyGenerator: (req) => {
-    // Use the phone/session_id from body or query. 
-    // This ensures credits are tracked per browser session.
     return req.body.phone || req.query.phone || req.ip;
   },
   handler: (req, res) => {
@@ -55,16 +52,20 @@ const openai = new OpenAI({
     baseURL: "https://api.deepseek.com/v1"
 });
 
-// ─── Database Setup (SQLite) ──────────────────────────────────────────────────
 let db;
-(async () => {
-  const dbPath = path.resolve(__dirname, "database.sqlite");
-  console.log("Initializing database at:", dbPath);
-  db = await open({
-    filename: dbPath,
-    driver: sqlite3.Database
-  });
-  await db.exec(`
+const DB_PATH = path.resolve(__dirname, "database.sqlite");
+
+async function initDatabase() {
+  const SQL = await initSqlJs();
+  
+  let data = null;
+  if (fs.existsSync(DB_PATH)) {
+    data = fs.readFileSync(DB_PATH);
+  }
+  
+  db = new SQL.Database(data);
+  
+  db.run(`
     CREATE TABLE IF NOT EXISTS leads (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       phone TEXT,
@@ -75,7 +76,7 @@ let db;
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await db.exec(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       phone TEXT,
@@ -84,56 +85,47 @@ let db;
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  await db.exec(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS credits (
       phone TEXT PRIMARY KEY,
       remaining INTEGER DEFAULT 5,
       last_reset DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  
+  saveDatabase();
   console.log("Database initialized successfully.");
-})();
+}
 
-// ─── In-memory session store (backed by SQLite) ──────────────────────────────
+function saveDatabase() {
+  if (db) {
+    const data = db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(DB_PATH, buffer);
+  }
+}
+
+initDatabase();
+
 const sessions = {};
-
-async function checkAndConsumeCredit(phone) {
-    let row = await db.get("SELECT * FROM credits WHERE phone = ?", [phone]);
-    const now = new Date();
-    
-    if (!row) {
-        await db.run("INSERT INTO credits (phone, remaining, last_reset) VALUES (?, 4, ?)", [phone, now.toISOString()]);
-        return 4;
-    }
-    
-    const lastReset = new Date(row.last_reset);
-    const diffHours = (now - lastReset) / (1000 * 60 * 60);
-    
-    if (diffHours >= 24) {
-        await db.run("UPDATE credits SET remaining = 4, last_reset = ? WHERE phone = ?", [now.toISOString(), phone]);
-        return 4;
-    }
-    
-    if (row.remaining <= 0) return -1;
-    
-    const newRemaining = row.remaining - 1;
-    await db.run("UPDATE credits SET remaining = ? WHERE phone = ?", [newRemaining, phone]);
-    return newRemaining;
-}
-
-async function getRemainingCredits(phone) {
-    let row = await db.get("SELECT * FROM credits WHERE phone = ?", [phone]);
-    if (!row) return 5;
-    const now = new Date();
-    const lastReset = new Date(row.last_reset);
-    if ((now - lastReset) / (1000 * 60 * 60) >= 24) return 5;
-    return row.remaining;
-}
 
 async function getSession(phone) {
   if (!sessions[phone]) {
-    const lead = await db.get("SELECT * FROM leads WHERE phone = ?", [phone]) || {};
-    const dbHistory = await db.all("SELECT role, content FROM history WHERE phone = ? ORDER BY timestamp ASC", [phone]);
+    const leadStmt = db.prepare("SELECT * FROM leads WHERE phone = ?");
+    leadStmt.bind([phone]);
+    let lead = {};
+    if (leadStmt.step()) {
+      lead = leadStmt.getAsObject();
+    }
+    leadStmt.free();
+    
+    const historyStmt = db.prepare("SELECT role, content FROM history WHERE phone = ? ORDER BY timestamp ASC");
+    historyStmt.bind([phone]);
+    const dbHistory = [];
+    while (historyStmt.step()) {
+      dbHistory.push(historyStmt.getAsObject());
+    }
+    historyStmt.free();
     
     let stage = "Asking Challenge";
     if (lead.email) stage = "Lead Captured";
@@ -148,7 +140,7 @@ async function getSession(phone) {
             challenge: lead.challenge || "",
             status: lead.status || "ongoing"
         }, 
-        history: dbHistory.length > 0 ? dbHistory : []
+        history: dbHistory
     };
   }
   return sessions[phone];
@@ -159,10 +151,10 @@ async function addToHistory(phone, role, content) {
     if (session) {
         session.history.push({ role, content });
     }
-    await db.run("INSERT INTO history (phone, role, content) VALUES (?, ?, ?)", [phone, role, content]);
+    db.run("INSERT INTO history (phone, role, content) VALUES (?, ?, ?)", [phone, role, content]);
+    saveDatabase();
 }
 
-// ─── AI Tools Definition ─────────────────────────────────────────────────────
 const tools = [
   {
     type: "function",
@@ -207,7 +199,6 @@ const tools = [
   }
 ];
 
-// ─── Coach persona ───────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `
 You are Coach Clara, a professional business and mindset coach.
 
@@ -229,30 +220,28 @@ RULES:
 - Be concise but warm.
 `;
 
-// ─── Save lead (SQLite) ────────────────────────────────────────────────────────
 async function saveLead(lead, phone) {
   lead.phone = phone;
   lead.timestamp = new Date().toISOString();
   
-  try {
-    const existing = await db.get("SELECT id FROM leads WHERE phone = ?", [phone]);
-    if (existing) {
-      await db.run(
-        "UPDATE leads SET name = ?, email = ?, challenge = ?, status = ? WHERE phone = ?",
-        [lead.name || "", lead.email || "", lead.challenge || "", lead.status || "ongoing", phone]
-      );
-    } else {
-      await db.run(
-        "INSERT INTO leads (phone, name, email, challenge, status) VALUES (?, ?, ?, ?, ?)",
-        [phone, lead.name || "", lead.email || "", lead.challenge || "", lead.status || "ongoing"]
-      );
-    }
-  } catch (error) {
-    console.error("Database save failed:", error);
+  const existingStmt = db.prepare("SELECT id FROM leads WHERE phone = ?");
+  existingStmt.bind([phone]);
+  const exists = existingStmt.step();
+  existingStmt.free();
+  
+  if (exists) {
+    db.run(
+      "UPDATE leads SET name = ?, email = ?, challenge = ?, status = ? WHERE phone = ?",
+      [lead.name || "", lead.email || "", lead.challenge || "", lead.status || "ongoing", phone]
+    );
+  } else {
+    db.run(
+      "INSERT INTO leads (phone, name, email, challenge, status) VALUES (?, ?, ?, ?, ?)",
+      [phone, lead.name || "", lead.email || "", lead.challenge || "", lead.status || "ongoing"]
+    );
   }
+  saveDatabase();
 }
-
-// ─── API Handlers ────────────────────────────────────────────────────────────
 
 app.post("/api/chat", aiLimiter, async (req, res) => {
   const { message, phone } = req.body;
@@ -260,34 +249,18 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
   if (!message) return res.status(400).json({ error: "Message required" });
 
   try {
-    // 1. Credit Check from DB
-    const remaining = await checkAndConsumeCredit(userPhone);
-    if (remaining === -1) {
-        return res.status(429).json({ 
-            reply: "Whoa there, speed racer! 🏎️ You've used up your 5 daily credits. Coach Clara needs a coffee break, and so does my API quota. \n\n**Love this system?** I can build one for your business too! Reach out to my creator at **ebubeimoh@gmail.com** and let's automate your hustle. 😉",
-            error: "Rate limit exceeded",
-            reasoning: "Rate limit reached. Creator contact recommended.",
-            confidence: "1.00",
-            stage: "Limit Reached",
-            remaining: 0
-        });
-    }
-
     const session = await getSession(userPhone);
     session.phone = userPhone;
     const pipelineSteps = [];
     
     pipelineSteps.push({ step: "received", label: "Message Received", timestamp: new Date().toISOString(), details: { message } });
     
-    // Add to SQLite history immediately
     await addToHistory(userPhone, "user", message);
 
-    // AI Call with Tool Use Loop
     let assistantMsg;
     let toolCallsProcessed = 0;
     let toolWasCalled = false;
     
-    // We loop up to 3 times to allow for multiple tool calls or a final response
     while (toolCallsProcessed < 3) {
         const response = await openai.chat.completions.create({
             model: "deepseek-chat",
@@ -300,7 +273,7 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
         
         if (assistantMsg.tool_calls) {
             toolWasCalled = true;
-            session.history.push(assistantMsg); // Add the assistant's request to call tools
+            session.history.push(assistantMsg);
 
             for (const toolCall of assistantMsg.tool_calls) {
                 const args = JSON.parse(toolCall.function.arguments);
@@ -321,7 +294,6 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
                     pipelineSteps.push({ step: "stored", label: "Lead Finalized", details: args, timestamp: new Date().toISOString() });
                 }
 
-                // Add tool result to history
                 session.history.push({
                     role: "tool",
                     tool_call_id: toolCall.id,
@@ -331,21 +303,17 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
             
             await saveLead(session.lead, userPhone);
             toolCallsProcessed++;
-            continue; // Go back for the model to generate a text response
+            continue;
         } else {
-            break; // No tool calls, we have our final text response
+            break;
         }
     }
 
     let reply = assistantMsg.content || "I've noted that down. What's next?";
-    
-    // Clean up any leaked DeepSeek internal tokens
     reply = reply.replace(/<｜DSML｜.*?>/gs, "").trim();
     
-    // Final assistant reply to SQLite
     await addToHistory(userPhone, "assistant", reply);
 
-    // Determine stage
     let status = "ongoing";
     if (session.lead.name && session.lead.email) {
         session.stage = "Lead Captured";
@@ -358,7 +326,6 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
         session.stage = "Asking Challenge";
     }
 
-    // Reasoning & Confidence
     const confidence = toolWasCalled ? "0.98" : "0.75";
     const reasoning = toolWasCalled ? "AI updated lead data and generated a contextual response." : "Engaging in natural conversation flow.";
 
@@ -372,8 +339,7 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
       history: session.history,
       stage: session.stage,
       reasoning,
-      confidence,
-      remaining: await getRemainingCredits(userPhone)
+      confidence
     });
   } catch (err) {
     console.error("Bot error:", err);
@@ -381,7 +347,6 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
   }
 });
 
-// ─── Twilio WhatsApp webhook (kept for compatibility) ────────────────────────
 app.post("/webhook", aiLimiter, async (req, res) => {
   const userMsg = req.body.Body?.trim();
   const phone = req.body.From;
@@ -436,15 +401,6 @@ app.post("/webhook", aiLimiter, async (req, res) => {
   }
 });
 
-app.get("/api/credits/:phone", async (req, res) => {
-  try {
-    const remaining = await getRemainingCredits(req.params.phone);
-    res.json({ remaining });
-  } catch (err) {
-    res.status(500).json({ error: "Credit fetch error" });
-  }
-});
-
 app.get("/api/session/:phone", async (req, res) => {
   try {
     const session = await getSession(req.params.phone);
@@ -460,8 +416,13 @@ app.get("/api/session/:phone", async (req, res) => {
 
 app.get("/api/leads", async (req, res) => {
   try {
-    const leads = await db.all("SELECT * FROM leads ORDER BY timestamp DESC");
-    res.json(leads);
+    const results = [];
+    const stmt = db.prepare("SELECT * FROM leads ORDER BY timestamp DESC");
+    while (stmt.step()) {
+      results.push(stmt.getAsObject());
+    }
+    stmt.free();
+    res.json(results);
   } catch (err) {
     res.status(500).json({ error: "Database error" });
   }
