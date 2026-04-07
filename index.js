@@ -507,15 +507,36 @@ app.post("/webhook", aiLimiter, async (req, res) => {
 });
 
 async function sendWhatsAppMessage(to, message) {
-  const phoneNumberId = process.env.PHONE_NUMBER_ID || "1103848609469798";
+  const phoneNumberId = process.env.PHONE_NUMBER_ID;
   const accessToken = process.env.WHATSAPP_TOKEN;
   
-  console.log("Sending WhatsApp message:", { to, phoneNumberId, hasToken: !!accessToken });
+  console.log(`[sendWhatsAppMessage] phoneNumberId: ${phoneNumberId}, accessToken exists: ${!!accessToken}, to: ${to}`);
   
-  if (!accessToken) {
-    console.log("WhatsApp access token not configured - skipping send");
+  if (!phoneNumberId || !accessToken) {
+    console.log("[sendWhatsAppMessage] WhatsApp credentials not configured");
     return;
   }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: to,
+        text: { body: message }
+      })
+    });
+    const result = await response.json();
+    console.log("[sendWhatsAppMessage] WhatsApp response:", result);
+    return result;
+  } catch (err) {
+    console.error("[sendWhatsAppMessage] Failed to send WhatsApp message:", err);
+  }
+}
 
   try {
     const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
@@ -565,6 +586,8 @@ ${conversationText}`;
 }
 
 async function notifyCoach(type, leadName, leadEmail, leadPhone, message) {
+  console.log(`[notifyCoach] Attempting to notify coach - Type: ${type}, Lead: ${leadName}, Email: ${leadEmail}, Phone: ${leadPhone}`);
+  
   const typeEmoji = {
     "new_lead": "🎉",
     "feedback": "💬",
@@ -581,6 +604,9 @@ async function notifyCoach(type, leadName, leadEmail, leadPhone, message) {
 *Message:* ${message}
 
 _AI Assistant_`;
+  
+  console.log(`[notifyCoach] Sending to coach number: ${COACH_WHATSAPP}`);
+  console.log(`[notifyCoach] Message: ${coachMsg}`);
   
   await sendWhatsAppMessage(COACH_WHATSAPP, coachMsg);
   console.log(`Coach notified: ${type} - ${leadName || "Unknown"}`);
