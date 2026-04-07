@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 import fs from "fs";
+import { google } from 'googleapis';
+import fetch from 'node-fetch';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,6 +58,8 @@ app.use(express.json({
 }));
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY;
+const COACH_WHATSAPP = process.env.COACH_WHATSAPP || "2347048702401";
+
 const openai = new OpenAI({
     apiKey: DEEPSEEK_API_KEY,
     baseURL: "https://api.deepseek.com/v1"
@@ -228,6 +232,28 @@ const tools = [
         }
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_coach_notification",
+      description: "Send a notification to the coach's WhatsApp with lead details or feedback.",
+      parameters: {
+        type: "object",
+        properties: {
+          notification_type: { 
+            type: "string", 
+            enum: ["new_lead", "feedback", "meeting_request", "insight"],
+            description: "Type of notification" 
+          },
+          lead_name: { type: "string", description: "Name of the lead" },
+          lead_email: { type: "string", description: "Email of the lead" },
+          lead_phone: { type: "string", description: "Phone number of the lead" },
+          message: { type: "string", description: "Additional message or feedback" }
+        },
+        required: ["notification_type", "message"]
+      }
+    }
   }
 ];
 
@@ -240,16 +266,18 @@ CONVERSATION FLOW:
 1. GREET - Warm welcome.
 2. ASK CHALLENGE - Ask what's their biggest challenge.
 3. QUALIFY - Acknowledge the challenge and ask for their NAME.
-4. COLLECT EMAIL - Ask for their email to send a free guide.
+4. CLOSE - When both name and email are captured, confirm and let them know the coach will reach out soon.
 
 TOOLS:
 - Use 'record_user_challenge' as soon as the user describes their struggle.
 - Use 'update_user_identity' when they share their name or email.
 - Use 'mark_lead_captured' ONLY after collecting both Name AND Email.
+- Use 'send_coach_notification' when a lead is captured or important feedback is received.
 
 RULES:
 - ONE QUESTION AT A TIME.
 - Be concise but warm.
+- When closing, tell the user: "Thank you! I'll have Coach Clara reach out to you shortly."
 `;
 
 async function saveLead(lead, phone) {
@@ -325,6 +353,14 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
                 if (toolCall.function.name === "mark_lead_captured") {
                     session.lead.status = "lead_captured";
                     pipelineSteps.push({ step: "stored", label: "Lead Finalized", details: args, timestamp: new Date().toISOString() });
+                    
+                    const summary = await generateConversationSummary(session.history, session.lead);
+                    await notifyCoach("new_lead", session.lead.name, session.lead.email, userPhone, summary);
+                }
+                
+                if (toolCall.function.name === "send_coach_notification") {
+                    await notifyCoach(args.notification_type, args.lead_name, args.lead_email, args.lead_phone, args.message);
+                    pipelineSteps.push({ step: "notification", label: "Coach Notified", details: args, timestamp: new Date().toISOString() });
                 }
 
                 session.history.push({
@@ -498,6 +534,55 @@ async function sendWhatsAppMessage(to, message) {
   } catch (err) {
     console.error("Failed to send WhatsApp message:", err);
   }
+}
+
+async function generateConversationSummary(history, lead) {
+  const conversationText = history
+    .filter(msg => msg.role !== "tool" && msg.content)
+    .map(msg => `${msg.role === "user" ? "User" : "Coach"}: ${msg.content}`)
+    .join("\n");
+
+  const summaryPrompt = `Analyze this conversation between Coach Clara and a lead. Provide a brief 2-3 sentence summary covering: 1) What challenge/problem the lead shared, 2) Key details about the lead. 
+
+Conversation:
+${conversationText}`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "deepseek-chat",
+      messages: [
+        { role: "system", content: "You are a helpful assistant that summarizes conversations concisely." },
+        { role: "user", content: summaryPrompt }
+      ],
+      max_tokens: 150
+    });
+    return response.choices[0].message.content || `Lead: ${lead.name || "Unknown"}`;
+  } catch (err) {
+    console.error("Summary generation failed:", err);
+    return `Lead captured: ${lead.name || "Unknown"} (${lead.email || "N/A"}) - Challenge: ${lead.challenge || "Not recorded"}`;
+  }
+}
+
+async function notifyCoach(type, leadName, leadEmail, leadPhone, message) {
+  const typeEmoji = {
+    "new_lead": "🎉",
+    "feedback": "💬",
+    "meeting_request": "📅",
+    "insight": "💡"
+  };
+  
+  const coachMsg = `${typeEmoji[type] || "📩"} *Coach Clara Alert*
+
+*Type:* ${type.replace("_", " ").toUpperCase()}
+*Lead:* ${leadName || "Unknown"}
+*Email:* ${leadEmail || "N/A"}
+*Phone:* ${leadPhone || "N/A"}
+*Message:* ${message}
+
+_AI Assistant_`;
+  
+  await sendWhatsAppMessage(COACH_WHATSAPP, coachMsg);
+  console.log(`Coach notified: ${type} - ${leadName || "Unknown"}`);
 }
 
 app.get("/api/session/:phone", async (req, res) => {
