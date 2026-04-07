@@ -499,6 +499,14 @@ app.post("/webhook", aiLimiter, async (req, res) => {
     await addToHistory(phone, "assistant", reply);
     await sendWhatsAppMessage(phone, reply);
 
+    if (session.lead.name && session.lead.email && session.lead.status !== "lead_captured") {
+      console.log("[webhook] Lead captured - notifying coach");
+      session.lead.status = "lead_captured";
+      await saveLead(session.lead, phone);
+      const summary = await generateConversationSummary(session.history, session.lead);
+      await notifyCoach("new_lead", session.lead.name, session.lead.email, phone, summary);
+    }
+
     res.json({ object: "whatsapp_business_account", entry: [] });
   } catch (err) {
     console.error("Webhook error:", err);
@@ -535,26 +543,6 @@ async function sendWhatsAppMessage(to, message) {
     return result;
   } catch (err) {
     console.error("[sendWhatsAppMessage] Failed to send WhatsApp message:", err);
-  }
-}
-
-  try {
-    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to: to,
-        text: { body: message }
-      })
-    });
-    const result = await response.json();
-    console.log("WhatsApp response:", result);
-  } catch (err) {
-    console.error("Failed to send WhatsApp message:", err);
   }
 }
 
