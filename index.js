@@ -49,7 +49,11 @@ const aiLimiter = rateLimit({
 
 app.use(generalLimiter);
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    console.log("Raw body:", buf.toString());
+  }
+}));
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY;
 const openai = new OpenAI({
@@ -113,6 +117,29 @@ function saveDatabase() {
 initDatabase();
 
 const sessions = {};
+
+async function checkAndConsumeCredit(phone) {
+  const stmt = db.prepare("SELECT remaining FROM credits WHERE phone = ?");
+  stmt.bind([phone]);
+  
+  if (stmt.step()) {
+    const row = stmt.getAsObject();
+    stmt.free();
+    
+    if (row.remaining <= 0) {
+      return -1;
+    }
+    
+    db.run("UPDATE credits SET remaining = remaining - 1 WHERE phone = ?", [phone]);
+    saveDatabase();
+    return row.remaining - 1;
+  } else {
+    stmt.free();
+    db.run("INSERT INTO credits (phone, remaining) VALUES (?, 4)", [phone]);
+    saveDatabase();
+    return 4;
+  }
+}
 
 async function getSession(phone) {
   if (!sessions[phone]) {
@@ -443,11 +470,13 @@ app.post("/webhook", aiLimiter, async (req, res) => {
 });
 
 async function sendWhatsAppMessage(to, message) {
-  const phoneNumberId = process.env.PHONE_NUMBER_ID;
+  const phoneNumberId = process.env.PHONE_NUMBER_ID || "1103848609469798";
   const accessToken = process.env.WHATSAPP_TOKEN;
   
-  if (!phoneNumberId || !accessToken) {
-    console.log("WhatsApp credentials not configured");
+  console.log("Sending WhatsApp message:", { to, phoneNumberId, hasToken: !!accessToken });
+  
+  if (!accessToken) {
+    console.log("WhatsApp access token not configured - skipping send");
     return;
   }
 
