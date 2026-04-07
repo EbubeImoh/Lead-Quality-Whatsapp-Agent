@@ -533,13 +533,21 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Coach Clara bot is running" });
 });
 
+app.get("/test-webhook", (req, res) => {
+  res.json({ 
+    message: "Webhook endpoint is reachable",
+    time: new Date().toISOString(),
+    hint: "POST a test payload to /webhook to verify"
+  });
+});
+
 app.get("/webhook", (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'] || req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
   const verifyToken = process.env.VERIFY_TOKEN || "my_verify_token";
 
-  console.log("Webhook verification request:", { mode, token, challenge, verifyToken });
+  console.log("GET /webhook - Webhook verification request:", { mode, token, challenge, verifyToken });
 
   if (mode === 'subscribe' && token === verifyToken) {
     console.log("Webhook verified!");
@@ -547,6 +555,32 @@ app.get("/webhook", (req, res) => {
   } else {
     console.log("Verification failed:", { received: token, expected: verifyToken });
     res.sendStatus(403);
+  }
+});
+
+app.post("/subscribe-webhooks", async (req, res) => {
+  const accessToken = process.env.WHATSAPP_TOKEN;
+  
+  if (!accessToken) {
+    return res.status(400).json({ error: "WHATSAPP_TOKEN not configured" });
+  }
+
+  const wabaId = "1586811042375335"; // WhatsApp Business Account ID from your dashboard
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${wabaId}/subscribed_apps`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      }
+    });
+    const result = await response.json();
+    console.log("Subscribe webhooks result:", result);
+    res.json(result);
+  } catch (err) {
+    console.error("Subscribe webhooks error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
