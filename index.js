@@ -588,7 +588,6 @@ async function notifyCoach(type, leadName, leadEmail, leadPhone, message) {
 *Type:* ${type.replace("_", " ").toUpperCase()}
 *Lead:* ${leadName || "Unknown"}
 *Email:* ${leadEmail || "N/A"}
-*Phone:* ${leadPhone || "N/A"}
 *Message:* ${message}
 
 _AI Assistant_`;
