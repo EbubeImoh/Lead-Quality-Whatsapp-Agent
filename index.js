@@ -348,9 +348,25 @@ app.post("/api/chat", aiLimiter, async (req, res) => {
 });
 
 app.post("/webhook", aiLimiter, async (req, res) => {
-  const userMsg = req.body.Body?.trim();
-  const phone = req.body.From;
-  if (!userMsg || !phone) return res.status(400).send("Bad request");
+  console.log("Webhook received:", JSON.stringify(req.body));
+  
+  let userMsg, phone;
+  
+  if (req.body.entry && req.body.entry[0]?.changes) {
+    const change = req.body.entry[0].changes[0];
+    if (change.value?.messages?.[0]) {
+      userMsg = change.value.messages[0].text?.body || change.value.messages[0].interactive?.button?.payload;
+      phone = change.value.messages[0].from;
+    }
+  } else {
+    userMsg = req.body.Body?.trim();
+    phone = req.body.From;
+  }
+  
+  if (!userMsg || !phone) {
+    console.log("No message or phone found");
+    return res.status(200).send("OK");
+  }
 
   try {
     const session = await getSession(phone);
@@ -392,14 +408,43 @@ app.post("/webhook", aiLimiter, async (req, res) => {
     const reply = assistantMsg.content || "Noted!";
     session.history.push({ role: "assistant", content: reply });
 
-    res.set("Content-Type", "text/xml");
-    res.send(`<Response><Message>${reply}</Message></Response>`);
+    await sendWhatsAppMessage(phone, reply);
+
+    res.json({ object: "whatsapp_business_account", entry: [] });
   } catch (err) {
     console.error("Webhook error:", err);
-    res.set("Content-Type", "text/xml");
-    res.send(`<Response><Message>Sorry, I had a hiccup!</Message></Response>`);
+    res.status(500).send("Error");
   }
 });
+
+async function sendWhatsAppMessage(to, message) {
+  const phoneNumberId = process.env.PHONE_NUMBER_ID;
+  const accessToken = process.env.WHATSAPP_TOKEN;
+  
+  if (!phoneNumberId || !accessToken) {
+    console.log("WhatsApp credentials not configured");
+    return;
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: to,
+        text: { body: message }
+      })
+    });
+    const result = await response.json();
+    console.log("WhatsApp response:", result);
+  } catch (err) {
+    console.error("Failed to send WhatsApp message:", err);
+  }
+}
 
 app.get("/api/session/:phone", async (req, res) => {
   try {
