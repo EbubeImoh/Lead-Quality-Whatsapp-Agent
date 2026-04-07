@@ -429,4 +429,23 @@ app.get("/api/leads", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  res.json({ status: "ok", message: "Coach Clara bot is running" });
+});
+
+app.get("/webhook", (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  const verifyToken = process.env.VERIFY_TOKEN || "my_verify_token";
+
+  if (mode === 'subscribe' && token === verifyToken) {
+    console.log("Webhook verified!");
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
 app.listen(PORT, () => console.log(`Bot live on port ${PORT}`));
