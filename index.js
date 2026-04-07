@@ -6,8 +6,6 @@ import { fileURLToPath } from 'url';
 import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 import fs from "fs";
-import { google } from 'googleapis';
-import fetch from 'node-fetch';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
