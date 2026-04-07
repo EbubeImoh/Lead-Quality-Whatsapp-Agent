@@ -56,7 +56,7 @@ app.use(express.json({
 }));
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY;
-const COACH_WHATSAPP = process.env.COACH_WHATSAPP || "2347048702401";
+const COACH_WHATSAPP = process.env.COACH_WHATSAPP || "2348167583290";
 
 const openai = new OpenAI({
     apiKey: DEEPSEEK_API_KEY,
@@ -475,6 +475,9 @@ app.post("/webhook", aiLimiter, async (req, res) => {
                 }
                 if (toolCall.function.name === "mark_lead_captured") {
                     session.lead.status = "lead_captured";
+                    
+                    const summary = await generateConversationSummary(session.history, session.lead);
+                    await notifyCoach("new_lead", session.lead.name, session.lead.email, phone, summary);
                 }
                 session.history.push({
                     role: "tool",
